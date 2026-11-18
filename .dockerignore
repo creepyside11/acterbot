@@ -1,7 +1,10 @@
-.git/
+.git
+.venv
 .env
-state/
-.venv/
-**/__pycache__/
-tests/
-node/tests/
+.env.*
+data
+tests
+**/__pycache__
+*.zip
+
+workspace/

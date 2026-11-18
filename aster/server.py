@@ -2,11 +2,13 @@ import asyncio
 import hmac
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
-from urllib.parse import quote
+from pathlib import Path, PurePosixPath
+from typing import Annotated, Literal
+from urllib.parse import quote, urlencode
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import Path as PathParam
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -14,10 +16,14 @@ from pydantic import BaseModel, Field
 
 from .agent import Agent, ProviderError, completion, result_text
 from .config import MAX_BODY, MAX_FILE, MAX_FILES, Config, ModelConfig
-from .store import Store
+from .store import Store, safe_name
 from .telegram import Telegram
+from .workspace import WorkspaceConflict, parts_for
 
 STATIC = Path(__file__).parent / "static"
+SQLITE_MAX_ID = 2**63 - 1
+JobID = Annotated[int, PathParam(ge=1, le=SQLITE_MAX_ID)]
+JobStatus = Literal["queued", "running", "done", "failed", "cancelled"]
 
 
 @asynccontextmanager
@@ -34,10 +40,7 @@ async def lifespan(app):
         tasks = [asyncio.create_task(agent.worker())]
         if config.telegram_token:
             telegram = Telegram(config, store, agent, client)
-            app.state.telegram = telegram
-            tasks.append(asyncio.create_task(telegram.notify()))
-            if config.telegram_poll:
-                tasks.append(asyncio.create_task(telegram.poll()))
+            tasks.extend((asyncio.create_task(telegram.poll()), asyncio.create_task(telegram.notify())))
         try:
             yield
         finally:
@@ -146,8 +149,12 @@ async def check_settings():
 
 
 @app.get("/api/jobs", dependencies=[Depends(authorized)])
-async def jobs(before: int | None = Query(None, gt=0)):
-    return app.state.store.list_jobs(before=before)
+async def jobs(
+    before: int | None = Query(None, ge=1, le=SQLITE_MAX_ID),
+    status: JobStatus | None = None,
+    q: str = Query("", max_length=160),
+):
+    return app.state.store.list_jobs(before=before, status=status, query=q)
 
 
 def find_job(job):
@@ -158,7 +165,7 @@ def find_job(job):
 
 
 @app.get("/api/jobs/{job}", dependencies=[Depends(authorized)])
-async def job_detail(job: int):
+async def job_detail(job: JobID):
     item = find_job(job)
     return {key: value for key, value in item.items() if key not in {"source", "chat", "notified"}}
 
@@ -166,7 +173,7 @@ async def job_detail(job: int):
 @app.post("/api/jobs", status_code=201, dependencies=[Depends(authorized)])
 async def new_job(
     prompt: str = Form(max_length=16_000),
-    parent: int | None = Form(None),
+    parent: int | None = Form(None, ge=1, le=SQLITE_MAX_ID),
     files: list[UploadFile] | None = File(None),
 ):
     if not app.state.store.model().model:
@@ -190,7 +197,7 @@ async def new_job(
 
 
 @app.post("/api/jobs/{job}/cancel", dependencies=[Depends(authorized)])
-async def stop_job(job: int):
+async def stop_job(job: JobID):
     find_job(job)
     if not app.state.agent.cancel(job):
         raise HTTPException(409, "Задача уже завершилась")
@@ -198,7 +205,7 @@ async def stop_job(job: int):
 
 
 @app.post("/api/jobs/{job}/retry", status_code=201, dependencies=[Depends(authorized)])
-async def retry_job(job: int):
+async def retry_job(job: JobID):
     item = find_job(job)
     if item["status"] in {"queued", "running"}:
         raise HTTPException(409, "Задача ещё активна")
@@ -212,8 +219,8 @@ async def retry_job(job: int):
     return {"id": new_id}
 
 
-def signed_download(ident, expiry):
-    payload = f"download:{ident}:{expiry}"
+def signed_download(ident, expiry, kind="download"):
+    payload = f"{kind}:{ident}:{expiry}"
     return hmac.digest(app.state.config.signing, payload.encode(), "sha256").hex()
 
 
@@ -232,35 +239,65 @@ async def download(ident: str, e: int, s: str):
     item = app.state.store.file(ident)
     if item is None:
         raise HTTPException(404, "Файл не найден")
-    return Response(item["data"], media_type="application/octet-stream", headers={
-        "Content-Disposition": "attachment; filename=\"download\"; filename*=UTF-8''" + quote(item["name"]),
+    return attachment(item["name"], item["data"])
+
+
+def attachment(name, data):
+    return Response(data, media_type="application/octet-stream", headers={
+        "Content-Disposition": "attachment; filename=\"download\"; filename*=UTF-8''" + quote(name, safe=""),
         "Access-Control-Allow-Origin": "https://web.telegram.org",
         "Content-Security-Policy": "default-src 'none'; sandbox",
     })
 
 
-
-def gateway_auth(authorization: str = Header(default="")):
-    key = app.state.config.gateway_key
-    if not key or not hmac.compare_digest(authorization.encode(), ("Bearer " + key).encode()):
-        raise HTTPException(401, "Доступ шлюза запрещён")
-
-
-@app.get("/gateway/status", dependencies=[Depends(gateway_auth)])
-async def gateway_status():
-    return {"ready": True, "model": bool(app.state.store.model().model)}
+def workspace():
+    folder = app.state.agent.workspace
+    if folder is None:
+        raise HTTPException(409, "Рабочая папка VPS не подключена")
+    return folder
 
 
-@app.post("/gateway/update", dependencies=[Depends(gateway_auth)])
-async def gateway_update(request: Request):
-    size = request.headers.get("content-length")
-    if not size or not size.isdecimal() or len(size) > 6 or int(size) > 262_144:
-        raise HTTPException(413, "Слишком большое сообщение")
+@app.get("/api/workspace", dependencies=[Depends(authorized)])
+async def list_workspace(path: str = Query(".", max_length=800)):
     try:
-        payload = await request.json()
-        if not isinstance(payload["message"], dict) or type(payload["update_id"]) is not int:
-            raise ValueError
-    except (ValueError, KeyError, TypeError):
-        raise HTTPException(400, "Некорректное обновление Telegram") from None
-    await app.state.telegram.handle(payload)
-    return {"ok": True}
+        return await asyncio.to_thread(workspace().list, path)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.post("/api/workspace/upload", status_code=201, dependencies=[Depends(authorized)])
+async def upload_workspace(path: str = Form(".", max_length=800), file: UploadFile = File(...)):
+    folder = workspace()
+    data = await file.read(MAX_FILE + 1)
+    if len(data) > MAX_FILE:
+        raise HTTPException(413, "Файл превышает лимит 8 МБ")
+    try:
+        full = "/".join([*parts_for(path, root_allowed=True), safe_name(file.filename or "")])
+        return await asyncio.to_thread(folder.write, full, data, "", create_dirs=False)
+    except WorkspaceConflict as error:
+        raise HTTPException(409, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.post("/api/workspace/link", dependencies=[Depends(authorized)])
+async def workspace_link(path: str = Query(max_length=800)):
+    folder = workspace()
+    try:
+        await asyncio.to_thread(folder.check_file, path)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    expiry = int(time.time()) + 90
+    params = {"path": path, "e": expiry, "s": signed_download(path, expiry, "workspace")}
+    return {"url": "/workspace-download?" + urlencode(params)}
+
+
+@app.get("/workspace-download")
+async def workspace_download(path: str = Query(max_length=800), e: int = Query(), s: str = Query(max_length=64)):
+    if not hmac.compare_digest(s.encode(), signed_download(path, e, "workspace").encode()) or e < time.time():
+        raise HTTPException(401, "Срок ссылки истёк")
+    try:
+        data = await asyncio.to_thread(workspace().read, path)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return attachment(PurePosixPath(path).name, data)

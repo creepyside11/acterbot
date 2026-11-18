@@ -7,7 +7,7 @@ const statuses = {
   queued: "В очереди", running: "В работе", done: "Готово",
   failed: "Ошибка", cancelled: "Остановлено",
 };
-const pages = {work: "Рабочая область", history: "История", detail: "Задача", settings: "Настройки"};
+const pages = {work: "Рабочая область", history: "История", files: "Файлы VPS", detail: "Задача", settings: "Настройки"};
 const examples = {
   web: "Изучи https://example.com, проверь, для чего нужна эта страница, и сохрани выводы в Markdown.",
   file: "Изучи приложенный документ. Выдели главное и сохрани краткое резюме в TXT.",
@@ -20,6 +20,10 @@ let parent = null;
 let section;
 let jobId;
 let historyRows = [];
+let historyParams = new URLSearchParams();
+let historyRequest = 0;
+let workspacePath = ".";
+let workspaceRequest = 0;
 let detailSnapshot = "";
 let recentSnapshot = "";
 let busyRefresh = false;
@@ -91,9 +95,9 @@ function statusPill(status) {
   return element;
 }
 
-function drawJobs(target, list) {
+function drawJobs(target, list, emptyLabel = "Задач пока нет. Первая появится после запуска.") {
   if (!list.length) {
-    target.replaceChildren(node("p", "empty", "Задач пока нет. Первая появится после запуска."));
+    target.replaceChildren(node("p", "empty", emptyLabel));
     return;
   }
   target.replaceChildren(...list.map((job) => {
@@ -123,14 +127,18 @@ function button(label, action) {
 
 async function downloadFile(file) {
   const {url} = await api("/files/" + file.id + "/link", {method: "POST"});
+  openDownload(url, file.name);
+}
+
+function openDownload(url, name) {
   const full = new URL(url, location.origin);
   if (tg?.initData && tg.isVersionAtLeast?.("8.0") && tg.downloadFile) {
-    tg.downloadFile({url: full.href, file_name: file.name});
+    tg.downloadFile({url: full.href, file_name: name});
     return;
   }
   const link = node("a");
   link.href = full.href;
-  link.download = file.name;
+  link.download = name;
   document.body.append(link);
   link.click();
   link.remove();
@@ -259,15 +267,81 @@ function setParent(id) {
 }
 
 async function loadHistory(more = false) {
+  const request = ++historyRequest;
+  const params = new URLSearchParams(historyParams);
+  if (more && historyRows.length) params.set("before", historyRows.at(-1).id);
+  $("history-error").textContent = "";
+  $("load-more").disabled = true;
+  if (!more) $("load-more").hidden = true;
   try {
-    const before = more && historyRows.length ? "?before=" + historyRows.at(-1).id : "";
-    const rows = await api("/jobs" + before);
-    if (section !== "history") return;
+    const rows = await api("/jobs?" + params);
+    if (section !== "history" || request !== historyRequest) return;
     historyRows = more ? [...historyRows, ...rows] : rows;
-    drawJobs($("history-jobs"), historyRows);
+    drawJobs($("history-jobs"), historyRows, historyParams.size ? "Задачи по этим условиям не найдены." : undefined);
     $("load-more").hidden = rows.length < 80;
   } catch (error) {
-    if (section === "history") $("history-jobs").replaceChildren(node("p", "empty", error.message));
+    if (section !== "history" || request !== historyRequest) return;
+    if (!more) $("history-jobs").replaceChildren();
+    $("history-error").textContent = error.message;
+  } finally {
+    if (request === historyRequest) $("load-more").disabled = false;
+  }
+}
+
+function applyHistoryFilters() {
+  historyParams = new URLSearchParams();
+  const query = $("history-query").value.trim();
+  const status = $("history-status").value;
+  if (query) historyParams.set("q", query);
+  if (status) historyParams.set("status", status);
+  loadHistory();
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + " Б";
+  const [amount, unit] = bytes < 1024 * 1024 ? [bytes / 1024, "КБ"] : [bytes / (1024 * 1024), "МБ"];
+  return new Intl.NumberFormat("ru-RU", {maximumFractionDigits: 1}).format(amount) + " " + unit;
+}
+
+async function loadWorkspace(path = workspacePath) {
+  const request = ++workspaceRequest;
+  $("workspace-error").textContent = "";
+  $("workspace-pick").disabled = true;
+  $("workspace-truncated").hidden = true;
+  if (!settings.workspace) {
+    $("workspace-entries").replaceChildren(node("p", "empty", "Рабочая папка VPS не подключена."));
+    return;
+  }
+  try {
+    const result = await api("/workspace?" + new URLSearchParams({path}));
+    if (section !== "files" || request !== workspaceRequest) return;
+    workspacePath = path;
+    $("workspace-up").hidden = path === ".";
+    $("workspace-path").textContent = path === "." ? "/workspace" : "/workspace/" + path;
+    $("workspace-truncated").hidden = !result.truncated;
+    const rows = result.entries.map((entry) => {
+      const name = entry.path.split("/").at(-1);
+      const directory = entry.type === "directory";
+      const prefix = directory ? "Открыть " : "Скачать ";
+      const control = button(name, (el) => {
+        if (directory) return loadWorkspace(entry.path);
+        act(el, "workspace-error", async () => {
+          const {url} = await api("/workspace/link?" + new URLSearchParams({path: entry.path}), {method: "POST"});
+          openDownload(url, name);
+        });
+      });
+      control.className = "ghost workspace-row";
+      control.setAttribute("aria-label", prefix + name);
+      control.replaceChildren(icon(directory ? "folder" : "file"), node("span", "", name));
+      if (!directory) control.append(node("small", "hint", formatBytes(entry.bytes)));
+      control.append(icon(directory ? "arrow" : "download"));
+      return control;
+    });
+    $("workspace-entries").replaceChildren(...(rows.length ? rows : [node("p", "empty", "Папка пуста.")]));
+  } catch (error) {
+    if (section === "files" && request === workspaceRequest) $("workspace-error").textContent = error.message;
+  } finally {
+    if (request === workspaceRequest) $("workspace-pick").disabled = false;
   }
 }
 
@@ -275,7 +349,7 @@ function route() {
   if (!token) return;
   const name = location.hash.slice(1);
   const match = /^job\/([1-9]\d{0,15})$/.exec(name);
-  section = match ? "detail" : (["work", "history", "settings"].includes(name) ? name : "work");
+  section = match ? "detail" : (["work", "history", "files", "settings"].includes(name) ? name : "work");
   jobId = match?.[1];
   for (const id of Object.keys(pages)) $(id).hidden = id !== section;
   $("breadcrumb").textContent = pages[section];
@@ -285,6 +359,7 @@ function route() {
     else link.removeAttribute("aria-current");
   }
   if (section === "history") loadHistory();
+  if (section === "files") loadWorkspace();
   if (section === "detail") {
     $("detail-content").replaceChildren(node("p", "empty", "Загрузка…"));
     $("detail-error").textContent = "";
@@ -391,7 +466,33 @@ $("test-model").addEventListener("click", (event) => act(event.currentTarget, "s
   const {reply} = await api("/settings/test", {method: "POST"});
   $("settings-message").textContent = "API ответил" + (reply ? " · " + reply : "");
 }));
-$("load-more").addEventListener("click", (event) => act(event.currentTarget, "detail-error", () => loadHistory(true)));
+$("history-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  applyHistoryFilters();
+});
+$("history-status").addEventListener("change", applyHistoryFilters);
+$("load-more").addEventListener("click", () => loadHistory(true));
+$("workspace-up").addEventListener("click", () => loadWorkspace(workspacePath.split("/").slice(0, -1).join("/") || "."));
+$("workspace-refresh").addEventListener("click", () => loadWorkspace());
+$("workspace-pick").addEventListener("click", () => $("workspace-file").click());
+$("workspace-upload").addEventListener("submit", (event) => event.preventDefault());
+$("workspace-file").addEventListener("change", (event) => {
+  const file = event.target.files[0];
+  event.target.value = "";
+  if (!file) return;
+  const path = workspacePath;
+  $("workspace-message").textContent = "";
+  act($("workspace-pick"), "workspace-error", async () => {
+    if (file.size > 8 * 1024 * 1024) throw new Error("Файл превышает лимит 8 МБ");
+    const form = new FormData();
+    form.set("path", path);
+    form.set("file", file);
+    const saved = await api("/workspace/upload", {method: "POST", form});
+    if (section !== "files") return;
+    if (path === workspacePath) await loadWorkspace();
+    $("workspace-message").textContent = "Загружен /workspace/" + saved.path;
+  });
+});
 window.addEventListener("hashchange", route);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 setInterval(() => { if (!document.hidden) refresh(); }, 2200);

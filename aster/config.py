@@ -61,10 +61,6 @@ class Config:
         self.workspace = Path(workspace) if workspace else None
         self.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         self.telegram_owner = int(os.environ.get("TELEGRAM_OWNER_ID") or "0")
-        self.telegram_poll = os.environ.get("TELEGRAM_POLL", "1") == "1"
-        self.gateway_key = os.environ.get("GATEWAY_KEY", "")
-        if self.gateway_key and (len(self.gateway_key) < 32 or self.telegram_poll or not self.telegram_token):
-            raise RuntimeError("Для шлюза настройте токен и TELEGRAM_POLL=0")
         if self.telegram_token and (not BOT_TOKEN_PATTERN.fullmatch(self.telegram_token) or self.telegram_owner <= 0):
             raise RuntimeError("Заполните TELEGRAM_BOT_TOKEN и TELEGRAM_OWNER_ID в .env")
         self.public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")

@@ -163,12 +163,21 @@ class Store:
             self.log(db, job, "Задача добавлена в очередь")
             return job
 
-    def list_jobs(self, limit=80, before=None):
+    def list_jobs(self, limit=80, before=None, *, status=None, query=""):
+        needle = query.strip().casefold()
+        candidate = needle.removeprefix("#")
+        job_number = int(candidate) if candidate.isascii() and candidate.isdecimal() and len(candidate) <= 18 else None
         with self.connect() as db:
+            if needle:
+                db.create_function("casefold", 1, str.casefold, deterministic=True)
+                search = "AND (id = :job OR instr(casefold(prompt), :needle) > 0 OR instr(casefold(coalesce(answer, '')), :needle) > 0)"
+            else:
+                search = ""
             rows = db.execute(
-                """SELECT id, substr(prompt, 1, 240) AS prompt, status, created, started, ended
-                   FROM jobs WHERE (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?""",
-                (before, before, limit),
+                f"""SELECT id, substr(prompt, 1, 240) AS prompt, status, created, started, ended
+                    FROM jobs WHERE (:before IS NULL OR id < :before) AND (:status IS NULL OR status = :status)
+                    {search} ORDER BY id DESC LIMIT :limit""",
+                {"before": before, "status": status, "limit": limit, "job": job_number, "needle": needle},
             )
             return [dict(row) for row in rows]
 

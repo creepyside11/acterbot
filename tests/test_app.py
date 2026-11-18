@@ -73,9 +73,12 @@ class ApplicationTest(unittest.TestCase):
 
         self.addCleanup(stop_provider)
         self.base_url = f"http://127.0.0.1:{self.provider.server_port}/v1"
+        self.workspace = Path(self.directory.name) / "workspace"
+        self.workspace.mkdir()
         self.env = patch.dict(os.environ, {
             "PANEL_PASSWORD": PASSWORD, "DATA_SECRET": "test-" * 16,
             "DATABASE_PATH": str(Path(self.directory.name) / "state.db"),
+            "ASTER_WORKSPACE": str(self.workspace),
             "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_OWNER_ID": "", "BROWSER_URL": "",
             "AI_BASE_URL": self.base_url, "AI_MODEL": "test-model", "AI_API_KEY": "test-fixture-key",
         })
@@ -126,6 +129,54 @@ class ApplicationTest(unittest.TestCase):
         self.assertEqual(retry.status_code, 201)
         repeat = self.wait(retry.json()["id"], {"done", "failed"})
         self.assertTrue(any(item["kind"] == "input" for item in repeat["files"]))
+
+    def test_filter_and_search_job_history(self):
+        store = Store(Config())
+        done = store.create_job("Проверка файла")
+        store.finish(done, "done", answer="В готовом ОТЧЁТЕ есть таблица")
+        cancelled = store.create_job("Черновик")
+        store.finish(cancelled, "cancelled")
+        self.assertEqual(
+            [row["id"] for row in self.client.get("/api/jobs", headers=self.auth, params={
+                "q": "отчёте", "status": "done", "before": cancelled,
+            }).json()],
+            [done],
+        )
+        self.assertEqual(self.client.get("/api/jobs", headers=self.auth, params={"q": f"#{cancelled}"}).json()[0]["id"], cancelled)
+        self.assertEqual(self.client.get("/api/jobs", headers=self.auth, params={"q": "%"}).json(), [])
+        self.assertEqual(self.client.get("/api/jobs/9223372036854775808", headers=self.auth).status_code, 422)
+
+    def test_workspace_browser_access_and_upload_conflicts(self):
+        folder = self.workspace / "Материалы"
+        folder.mkdir()
+        outside = self.workspace.parent / "outside.txt"
+        outside.write_bytes(b"private fixture")
+        (folder / "link.txt").symlink_to(outside)
+        (folder / "bad\nname.txt").write_bytes(b"invalid path")
+        self.assertEqual(self.client.get("/api/workspace").status_code, 401)
+        params = {"path": "Материалы"}
+        files = {"file": ("отчёт.txt", b"workspace fixture", "text/plain")}
+        response = self.client.post("/api/workspace/upload", headers=self.auth, data=params, files=files)
+        self.assertEqual(response.status_code, 201, response.text)
+        path = response.json()["path"]
+        self.assertEqual(
+            self.client.get("/api/workspace", headers=self.auth, params=params).json()["entries"],
+            [{"path": path, "type": "file", "bytes": 17}],
+        )
+        link = self.client.post("/api/workspace/link", headers=self.auth, params={"path": path}).json()["url"]
+        download = self.client.get(link)
+        self.assertEqual(download.content, b"workspace fixture")
+        self.assertIn("attachment", download.headers["content-disposition"])
+        self.assertEqual(self.client.get(link[:-2]).status_code, 401)
+        collision = self.client.post(
+            "/api/workspace/upload", headers=self.auth, data=params, files={"file": ("отчёт.txt", b"overwrite")},
+        )
+        self.assertEqual(collision.status_code, 409)
+        for forbidden in ("../outside.txt", "Материалы/link.txt"):
+            self.assertEqual(self.client.post("/api/workspace/link", headers=self.auth, params={"path": forbidden}).status_code, 400)
+        unsafe_upload = self.client.post("/api/workspace/upload", headers=self.auth, data={"path": ".."}, files=files)
+        self.assertEqual(unsafe_upload.status_code, 400)
+        self.assertEqual(outside.read_bytes(), b"private fixture")
 
     def test_settings_and_vision(self):
         result = self.update_model(vision=True, tools=False)

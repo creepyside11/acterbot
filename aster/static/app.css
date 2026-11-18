@@ -118,6 +118,20 @@ h2 { font-size: 18px; letter-spacing: -.025em; }
 .events time { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 6px; }
 .file-list { display: flex; flex-wrap: wrap; gap: 8px; }
 .file-list button { max-width: 100%; overflow-wrap: anywhere; }
+.history-filters { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; margin-bottom: 12px; }
+.history-filters input, .history-filters select { min-width: 0; }
+.history-filters #history-query { margin-bottom: 0; }
+.history-filters select { font: inherit; font-size: 13px; padding: 8px; color: var(--ink); background: #171923; border: 1px solid #3a3b51; border-radius: 8px; }
+.workspace-head, .workspace-location, .workspace-upload { display: flex; align-items: center; gap: 10px; }
+.workspace-head { justify-content: space-between; flex-wrap: wrap; margin-bottom: 12px; }
+.workspace-location { min-width: 0; }
+.workspace-location code { color: var(--muted); overflow-wrap: anywhere; font-size: 13px; }
+.workspace-entries { display: grid; gap: 6px; }
+.workspace-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 10px; width: 100%; text-align: left; }
+.workspace-row span { overflow-wrap: anywhere; }
+.workspace-row svg:last-child { grid-column: 4; color: var(--muted); }
+.workspace-row small { margin: 0; white-space: nowrap; }
+#workspace-message:empty { display: none; }
 .subagent-list { display: grid; gap: 8px; }
 .subagent { border: 1px solid var(--border); border-radius: 9px; padding: 8px 11px; }
 .subagent-label { cursor: pointer; padding: 3px 0; color: var(--ink); font-size: 13px; overflow-wrap: anywhere; }
@@ -156,7 +170,7 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--purple);
   .mobile-brand, .mobile-only { display: inline-flex !important; }
   .mobile-brand .brand-icon { width: 31px; height: 31px; border-radius: 9px; }
   .mobile-brand svg { width: 18px; height: 18px; }
-  nav { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; margin: 0; }
+  nav { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 3px; margin: 0; }
   nav a { flex-direction: column; align-items: center; justify-content: center; min-height: 45px; gap: 4px; padding: 4px; font-size: 10px; }
   .topbar { height: 57px; padding: 0 15px; }
   .topbar .identity { font-size: 20px; gap: 8px; }

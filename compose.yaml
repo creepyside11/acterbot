@@ -1,11 +1,91 @@
-name: acter-installer
+name: aster-agent
+
 services:
-  installer:
-    build: .
+  app:
+    build:
+      context: .
+      target: app
     env_file: .env
+    environment:
+      DATABASE_PATH: /data/aster.sqlite3
+      ASTER_WORKSPACE: /workspace
+      BROWSER_URL: http://browser:8010
+    ports:
+      - "127.0.0.1:8000:8000"
     volumes:
-      - installer_data:/state
+      - agent_data:/data
+      - agent_workspace:/workspace
+    networks:
+      - control
+      - browser_link
+    read_only: true
+    tmpfs:
+      - /tmp:size=192m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     init: true
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 20s
+      timeout: 4s
+      retries: 3
+      start_period: 10s
+
+  browser:
+    build:
+      context: .
+      target: browser
+    environment:
+      BROWSER_TOKEN: ${BROWSER_TOKEN:?run python3 setup.py}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+    networks:
+      - browser_link
+      - browser_out
+    read_only: true
+    tmpfs:
+      - /tmp:size=384m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 180
+    mem_limit: 1100m
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=2)"]
+      interval: 20s
+      timeout: 4s
+      retries: 3
+      start_period: 20s
+
+  caddy:
+    image: caddy:2.11-alpine
+    profiles: ["https"]
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:-localhost}
+      TLS_HOST: ${TLS_HOST:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - certificates:/data
+      - caddy_config:/config
+    networks:
+      - control
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+
+networks:
+  control:
+  browser_out:
+  browser_link:
+    internal: true
+
 volumes:
-  installer_data:
+  agent_data:
+  agent_workspace:
+  certificates:
+  caddy_config:

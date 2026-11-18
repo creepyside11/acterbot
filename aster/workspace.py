@@ -17,15 +17,23 @@ REGULAR = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
 PAGE = 10_000
 
 
+class WorkspaceConflict(ValueError):
+    pass
+
+
+def valid_part(part):
+    return (
+        bool(part) and not part.startswith(".")
+        and not any(ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF or char == "\\" for char in part)
+        and len(part.encode()) <= 240
+    )
+
+
 def parts_for(path, root_allowed=False):
     if root_allowed and path in {"", "."}:
         return []
     parts = path.split("/")
-    if len(path) > 800 or len(parts) > 12 or any(
-        not part or part.startswith(".") or len(part.encode()) > 240 or
-        any(ord(char) < 32 or char == "\\" for char in part)
-        for part in parts
-    ):
+    if len(path) > 800 or len(parts) > 12 or not all(map(valid_part, parts)):
         raise ValueError("Укажите относительный путь в рабочей папке. Скрытые файлы недоступны")
     return parts
 
@@ -57,7 +65,8 @@ class Workspace:
             os.close(fd)
 
     @staticmethod
-    def read_at(directory, name):
+    @contextmanager
+    def open_file(directory, name):
         fd = os.open(name, REGULAR, dir_fd=directory)
         with os.fdopen(fd, "rb") as opened:
             info = os.fstat(opened.fileno())
@@ -65,6 +74,11 @@ class Workspace:
                 raise ValueError("Поддерживаются обычные файлы без ссылок")
             if info.st_size > MAX_FILE:
                 raise ValueError("Файл превышает лимит 8 МБ")
+            yield opened
+
+    @classmethod
+    def read_at(cls, directory, name):
+        with cls.open_file(directory, name) as opened:
             data = opened.read(MAX_FILE + 1)
             if len(data) > MAX_FILE:
                 raise ValueError("Файл превышает лимит 8 МБ")
@@ -74,6 +88,11 @@ class Workspace:
         parts = parts_for(path)
         with self.directory(parts[:-1]) as directory:
             return self.read_at(directory, parts[-1])
+
+    def check_file(self, path):
+        parts = parts_for(path)
+        with self.directory(parts[:-1]) as directory, self.open_file(directory, parts[-1]):
+            pass
 
     def read_page(self, path, offset):
         if offset < 0:
@@ -95,13 +114,17 @@ class Workspace:
     def list(self, path):
         parts = parts_for(path, root_allowed=True)
         entries = []
+        truncated = False
         with self.directory(parts) as directory, os.scandir(directory) as scanned:
-            for entry in islice(scanned, 401):
-                if len(entries) == 100:
+            for index, entry in enumerate(islice(scanned, 401)):
+                if index == 400 or len(entries) == 100:
+                    truncated = True
                     break
-                if entry.name.startswith("."):
+                if not valid_part(entry.name):
                     continue
                 entry_path = "/".join([*parts, entry.name])
+                if len(parts) == 12 or len(entry_path) > 800:
+                    continue
                 try:
                     info = entry.stat(follow_symlinks=False)
                 except FileNotFoundError:
@@ -110,11 +133,10 @@ class Workspace:
                     entries.append({"path": entry_path, "type": "directory"})
                 elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
                     entries.append({"path": entry_path, "type": "file", "bytes": info.st_size})
-            else:
-                return {"entries": sorted(entries, key=lambda item: item["path"]), "truncated": len(entries) == 100}
-        return {"entries": sorted(entries, key=lambda item: item["path"]), "truncated": True}
+        entries.sort(key=lambda item: (item["type"] != "directory", item["path"].casefold()))
+        return {"entries": entries, "truncated": truncated}
 
-    def write(self, path, data, expected_sha256):
+    def write(self, path, data, expected_sha256, *, create_dirs=True):
         parts = parts_for(path)
         if len(data) > MAX_FILE:
             raise ValueError("Файл превышает лимит 8 МБ")
@@ -122,7 +144,7 @@ class Workspace:
             raise ValueError("Укажите SHA-256 из чтения файла или пустую строку для нового файла")
         digest = hashlib.sha256(data).hexdigest()
         name = parts[-1]
-        with self.directory(parts[:-1], create=not expected_sha256) as directory:
+        with self.directory(parts[:-1], create=create_dirs and not expected_sha256) as directory:
             try:
                 current = self.read_at(directory, name)
             except FileNotFoundError:
@@ -131,9 +153,9 @@ class Workspace:
                 return {"path": path, "sha256": digest}
             if current is not None:
                 if hashlib.sha256(current).hexdigest() != expected_sha256:
-                    raise ValueError("Файл уже существует или изменился. Прочитайте его актуальную версию")
+                    raise WorkspaceConflict("Файл с таким именем уже существует или изменился")
             elif expected_sha256:
-                raise ValueError("Файл для обновления не найден")
+                    raise WorkspaceConflict("Файл для обновления не найден")
             temporary = ".aster-" + uuid.uuid4().hex
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640, dir_fd=directory)
             try:
@@ -143,13 +165,13 @@ class Workspace:
                     os.fsync(opened.fileno())
                 if expected_sha256:
                     if hashlib.sha256(self.read_at(directory, name)).hexdigest() != expected_sha256:
-                        raise ValueError("Файл изменился во время сохранения")
+                        raise WorkspaceConflict("Файл изменился во время сохранения")
                     os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
                 else:
                     try:
                         os.link(temporary, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
                     except FileExistsError as error:
-                        raise ValueError("Файл уже существует. Прочитайте его актуальную версию") from error
+                        raise WorkspaceConflict("Файл с таким именем уже существует") from error
             finally:
                 with suppress(FileNotFoundError):
                     os.unlink(temporary, dir_fd=directory)

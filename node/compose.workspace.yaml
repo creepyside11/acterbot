@@ -1,0 +1,8 @@
+services:
+  app:
+    volumes:
+      - type: bind
+        source: ${ASTER_HOST_WORKSPACE:?set ASTER_HOST_WORKSPACE}
+        target: /workspace
+        bind:
+          create_host_path: false

@@ -1,0 +1,11 @@
+name: acter-installer
+services:
+  installer:
+    build: .
+    env_file: .env
+    volumes:
+      - installer_data:/state
+    init: true
+    restart: unless-stopped
+volumes:
+  installer_data:
